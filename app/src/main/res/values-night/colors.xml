@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary_soft">#3A2A22</color>
+    <color name="bg">#15181D</color>
+    <color name="surface">#1E232B</color>
+    <color name="border">#313845</color>
+    <color name="header">#11151B</color>
+    <color name="text">#E6E8EB</color>
+    <color name="text_secondary">#9AA3AF</color>
+    <color name="code_bg">#10141A</color>
+    <color name="ok">#3DD68C</color>
+    <color name="warn">#F0C23B</color>
+    <color name="error">#FF7A7A</color>
+    <color name="method_get">#3DD68C</color>
+    <color name="method_post">#F0C23B</color>
+    <color name="method_put">#6AA2FF</color>
+    <color name="method_patch">#C58BE8</color>
+    <color name="method_delete">#FF7A7A</color>
+    <color name="method_other">#9AA3AF</color>
+</resources>

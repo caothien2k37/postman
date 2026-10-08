@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Bảng màu theo đặc tả (mục 2.3) -->
+    <color name="primary">#FF6C37</color>
+    <color name="primary_dark">#E5561F</color>
+    <color name="primary_soft">#FFF1EA</color>
+    <color name="white">#FFFFFF</color>
+    <color name="bg">#F6F6F6</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="border">#E5E5E5</color>
+    <color name="header">#212836</color>
+    <color name="on_header">#F3F4F6</color>
+    <color name="text">#1F2937</color>
+    <color name="text_secondary">#6B7280</color>
+    <color name="code_bg">#232832</color>
+    <color name="code_text">#E6EDF3</color>
+    <color name="code_string">#C3E88D</color>
+    <color name="ok">#148A54</color>
+    <color name="warn">#D6A100</color>
+    <color name="error">#D64545</color>
+
+    <color name="method_get">#148A54</color>
+    <color name="method_post">#D6A100</color>
+    <color name="method_put">#3977D5</color>
+    <color name="method_patch">#8E44AD</color>
+    <color name="method_delete">#D64545</color>
+    <color name="method_other">#6B7280</color>
+</resources>

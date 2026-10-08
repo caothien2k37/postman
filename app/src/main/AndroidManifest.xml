@@ -3,10 +3,17 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!--
+        allowBackup=false: cơ sở dữ liệu có thể chứa token/secret (được mã hóa bằng khóa Android Keystore
+        không sao lưu được), nên không đưa vào bản sao lưu đám mây.
+        usesCleartextTraffic=true: app dùng để gọi API trong mạng LAN qua http:// (như bản 1.x).
+    -->
     <application
-        android:allowBackup="true"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="Mini Postman Vars"
-        android:theme="@android:style/Theme.Material"
+        android:theme="@style/Theme.App"
         android:usesCleartextTraffic="true">
 
         <activity
@@ -19,12 +26,25 @@
             </intent-filter>
         </activity>
 
+        <!-- configChanges: xoay màn hình không tạo lại Activity nên không mất nội dung đang sửa dở -->
         <activity
             android:name=".RequestActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
             android:windowSoftInputMode="adjustResize" />
 
         <activity
             android:name=".EnvActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize"
             android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".ImportActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize" />
+
+        <activity android:name=".HistoryActivity" />
+
+        <activity
+            android:name=".RunnerActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|smallestScreenSize" />
     </application>
 </manifest>

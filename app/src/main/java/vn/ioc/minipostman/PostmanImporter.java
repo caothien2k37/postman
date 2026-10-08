@@ -1,174 +1,134 @@
 package vn.ioc.minipostman;
 
-import org.json.JSONArray;
-import org.json.JSONException;
-import org.json.JSONObject;
+import android.content.ContentResolver;
+import android.database.Cursor;
+import android.net.Uri;
+import android.provider.OpenableColumns;
 
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.List;
 import java.util.Locale;
 
-/** Đọc file Postman collection v2.x hoặc Postman environment. */
+import vn.ioc.minipostman.core.importexport.ImportResult;
+import vn.ioc.minipostman.core.importexport.PostmanParser;
+import vn.ioc.minipostman.core.model.EnvDoc;
+import vn.ioc.minipostman.core.model.KeyValue;
+import vn.ioc.minipostman.core.model.Node;
+import vn.ioc.minipostman.core.request.RequestModel;
+import vn.ioc.minipostman.data.CollectionRepository;
+
+/** Điều phối import ở tầng ứng dụng: đọc nguồn (file/URI), xử lý trùng tên và ghi vào DB. */
 public final class PostmanImporter {
+
+    /** Cách xử lý khi trùng tên (không bao giờ tự động ghi đè). */
+    public enum Conflict { COPY, REPLACE, SKIP }
 
     private static final String DEFAULT_EXTRACT = "accessToken = data.accessToken\nsessionId = data.sessionId";
 
     private PostmanImporter() {
     }
 
-    public static String importJson(Store store, String text) throws JSONException {
-        if (text.startsWith("\uFEFF")) text = text.substring(1);
-        JSONObject root = new JSONObject(text);
-        if (root.has("item")) return importCollection(store, root);
-        if (root.has("values")) return importEnvironment(store, root);
-        throw new JSONException("Không nhận ra file Postman (cần collection v2.x hoặc environment)");
-    }
-
-    private static String str(JSONObject o, String key) {
-        Object v = o.opt(key);
-        return (v == null || v == JSONObject.NULL) ? "" : String.valueOf(v);
-    }
-
-    private static String importEnvironment(Store store, JSONObject root) {
-        String name = str(root, "name");
-        if (name.isEmpty()) name = "Imported";
-        Store.Env env = store.findEnv(name);
-        if (env == null) {
-            env = new Store.Env(name);
-            store.envs.add(env);
+    /** Đọc nội dung một URI (SAF), từ chối file lớn hơn giới hạn. */
+    public static String readUri(ContentResolver cr, Uri uri) throws IOException {
+        try (InputStream in = cr.openInputStream(uri)) {
+            if (in == null) throw new IOException("Không mở được file");
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buf = new byte[16 * 1024];
+            int n;
+            long limit = PostmanParser.MAX_CHARS * 2L;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                if (out.size() > limit) {
+                    throw new IOException("File quá lớn (tối đa " + (PostmanParser.MAX_CHARS / 1024 / 1024) + " MB)");
+                }
+            }
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
         }
-        int n = 0;
-        JSONArray vals = root.optJSONArray("values");
-        if (vals != null) {
-            for (int i = 0; i < vals.length(); i++) {
-                JSONObject v = vals.optJSONObject(i);
-                if (v == null || !v.optBoolean("enabled", true)) continue;
-                String k = str(v, "key");
-                if (k.isEmpty()) continue;
-                env.vars.put(k, str(v, "value"));
+    }
+
+    public static String displayName(ContentResolver cr, Uri uri) {
+        try (Cursor c = cr.query(uri, new String[]{OpenableColumns.DISPLAY_NAME}, null, null, null)) {
+            if (c != null && c.moveToFirst()) {
+                String n = c.getString(0);
+                if (n != null && !n.isEmpty()) return n;
+            }
+        } catch (RuntimeException ignored) {
+            // Một số provider không hỗ trợ truy vấn tên.
+        }
+        String last = uri.getLastPathSegment();
+        return last == null ? "import.json" : last;
+    }
+
+    /** Có trùng tên với dữ liệu đang có không (gọi từ thread DB). */
+    public static boolean hasConflict(Store store, ImportResult r) {
+        if (r.isCollection()) return store.collections.findCollectionByName(r.name) != null;
+        if (r.kind == ImportResult.Kind.ENVIRONMENT) return store.envs.findByName(r.name) != null;
+        return false;
+    }
+
+    /** Ghi kết quả import vào DB và trả về thông báo cho người dùng (gọi từ thread DB). */
+    public static String commit(Store store, ImportResult r, Conflict conflict) {
+        boolean exists = hasConflict(store, r);
+        if (exists && conflict == Conflict.SKIP) return "Bỏ qua \"" + r.name + "\" (đã tồn tại)";
+
+        if (r.isCollection()) {
+            applyLegacyDefaults(r.collection.roots);
+            store.collections.importCollection(r.collection,
+                    conflict == Conflict.REPLACE ? CollectionRepository.ConflictMode.REPLACE
+                            : CollectionRepository.ConflictMode.COPY);
+            return "Đã import \"" + r.collection.name + "\": " + r.folders + " folder, " + r.requests + " request"
+                    + (r.scripts > 0 ? ", " + r.scripts + " script" : "");
+        }
+
+        if (r.kind == ImportResult.Kind.GLOBALS) {
+            EnvDoc g = store.envs.getGlobals();
+            int n = 0;
+            for (KeyValue kv : r.environment.vars.items()) {
+                if (!kv.enabled || kv.key.isEmpty()) continue;
+                g.vars.set(kv.key, kv.value);
+                if (kv.isSecret()) {
+                    for (KeyValue mine : g.vars.items()) {
+                        if (mine.key.equals(kv.key)) mine.type = "secret";
+                    }
+                }
                 n++;
             }
+            store.envs.save(g);
+            return "Đã nhập " + n + " biến vào Globals";
         }
-        store.activeEnv = store.envs.indexOf(env);
-        store.save();
-        return "Đã import environment \"" + name + "\" (" + n + " biến) và chọn làm môi trường hiện tại";
+
+        EnvDoc doc = r.environment;
+        if (exists && conflict == Conflict.REPLACE) {
+            EnvDoc old = store.envs.findByName(r.name);
+            if (old != null) {
+                doc.id = old.id;
+                doc.selected = old.selected;
+                store.envs.save(doc);
+                store.envs.select(doc.id);
+            }
+        } else {
+            store.envs.add(doc, true);
+        }
+        return "Đã import environment \"" + doc.name + "\" (" + r.variables + " biến) và chọn làm môi trường hiện tại";
     }
 
-    private static String importCollection(Store store, JSONObject root) {
-        int added = 0;
-        JSONArray cv = root.optJSONArray("variable");
-        if (cv != null) {
-            Store.Env env = store.activeEnvObj();
-            for (int i = 0; i < cv.length(); i++) {
-                JSONObject v = cv.optJSONObject(i);
-                if (v == null) continue;
-                String k = str(v, "key");
-                if (k.isEmpty() || env.vars.containsKey(k)) continue;
-                env.vars.put(k, str(v, "value"));
-                added++;
-            }
-        }
-        int[] count = {0};
-        walk(store, root.optJSONArray("item"), "", bearerOf(root.optJSONObject("auth")), count);
-        store.save();
-        return "Đã import " + count[0] + " request"
-                + (added > 0 ? ", thêm " + added + " biến vào môi trường \"" + store.activeEnvObj().name + "\"" : "");
-    }
-
-    private static String bearerOf(JSONObject auth) {
-        if (auth == null || !"bearer".equals(str(auth, "type"))) return null;
-        JSONArray arr = auth.optJSONArray("bearer");
-        if (arr != null) {
-            for (int i = 0; i < arr.length(); i++) {
-                JSONObject o = arr.optJSONObject(i);
-                if (o != null && "token".equals(str(o, "key"))) return str(o, "value");
-            }
-        }
-        return null;
-    }
-
-    private static void walk(Store store, JSONArray items, String folder, String inheritedAuth, int[] count) {
-        if (items == null) return;
-        for (int i = 0; i < items.length(); i++) {
-            JSONObject it = items.optJSONObject(i);
-            if (it == null) continue;
-            String name = str(it, "name");
-
-            if (it.has("item")) {
-                String a = bearerOf(it.optJSONObject("auth"));
-                String sub = folder.isEmpty() ? name : folder + " / " + name;
-                walk(store, it.optJSONArray("item"), sub, a != null ? a : inheritedAuth, count);
-                continue;
-            }
-
-            Store.Req r = new Store.Req();
-            r.folder = folder;
-            r.name = name.isEmpty() ? "Request" : name;
-            Object reqObj = it.opt("request");
-
-            if (reqObj instanceof String) {
-                r.url = (String) reqObj;
-            } else if (reqObj instanceof JSONObject) {
-                JSONObject rq = (JSONObject) reqObj;
-                String m = str(rq, "method");
-                r.method = m.isEmpty() ? "GET" : m.toUpperCase(Locale.ROOT);
-
-                Object u = rq.opt("url");
-                if (u instanceof JSONObject) r.url = str((JSONObject) u, "raw");
-                else if (u instanceof String) r.url = (String) u;
-
-                StringBuilder h = new StringBuilder();
-                boolean hasAuthHeader = false;
-                boolean hasContentType = false;
-                JSONArray hs = rq.optJSONArray("header");
-                if (hs != null) {
-                    for (int j = 0; j < hs.length(); j++) {
-                        JSONObject hh = hs.optJSONObject(j);
-                        if (hh == null) continue;
-                        String key = str(hh, "key");
-                        if (key.isEmpty()) continue;
-                        boolean disabled = hh.optBoolean("disabled", false);
-                        if (key.equalsIgnoreCase("Authorization") && !disabled) hasAuthHeader = true;
-                        if (key.equalsIgnoreCase("Content-Type") && !disabled) hasContentType = true;
-                        h.append(disabled ? "// " : "").append(key).append(": ").append(str(hh, "value")).append('\n');
-                    }
+    /**
+     * Như bản 1.x: request có "login", "token" hoặc "đăng nhập" trong tên/URL mà chưa có script post-response
+     * được điền sẵn quy tắc "Set biến từ response". Chỉ lưu ở cột extract, không đổi JSON Postman.
+     */
+    private static void applyLegacyDefaults(List<Node> nodes) {
+        for (Node n : nodes) {
+            if (n.type == Node.Type.REQUEST && n.extract.isEmpty()
+                    && RequestModel.scriptOf(n.raw, "test").trim().isEmpty()) {
+                String lower = (n.url() + " " + n.name).toLowerCase(Locale.ROOT);
+                if (lower.contains("login") || lower.contains("token") || lower.contains("đăng nhập")) {
+                    n.extract = DEFAULT_EXTRACT;
                 }
-
-                JSONObject ra = rq.optJSONObject("auth");
-                boolean noAuth = ra != null && "noauth".equals(str(ra, "type"));
-                String own = bearerOf(ra);
-                String auth = own != null ? own : (noAuth ? null : inheritedAuth);
-                if (auth != null && !hasAuthHeader) {
-                    h.append("Authorization: Bearer ").append(auth).append('\n');
-                }
-
-                JSONObject body = rq.optJSONObject("body");
-                if (body != null) {
-                    String mode = str(body, "mode");
-                    if ("raw".equals(mode)) {
-                        r.body = str(body, "raw");
-                    } else if ("urlencoded".equals(mode)) {
-                        JSONArray kv = body.optJSONArray("urlencoded");
-                        StringBuilder sb = new StringBuilder();
-                        if (kv != null) {
-                            for (int j = 0; j < kv.length(); j++) {
-                                JSONObject p = kv.optJSONObject(j);
-                                if (p == null || p.optBoolean("disabled", false)) continue;
-                                if (sb.length() > 0) sb.append('&');
-                                sb.append(str(p, "key")).append('=').append(str(p, "value"));
-                            }
-                        }
-                        r.body = sb.toString();
-                        if (!hasContentType) h.append("Content-Type: application/x-www-form-urlencoded\n");
-                    }
-                }
-                r.headers = h.toString().trim();
             }
-
-            String lower = (r.url + " " + r.name).toLowerCase(Locale.ROOT);
-            if (lower.contains("login") || lower.contains("token") || lower.contains("đăng nhập")) {
-                r.extract = DEFAULT_EXTRACT;
-            }
-            store.requests.add(r);
-            count[0]++;
+            applyLegacyDefaults(n.children);
         }
     }
 }

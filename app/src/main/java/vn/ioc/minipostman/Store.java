@@ -1,247 +1,132 @@
 package vn.ioc.minipostman;
 
 import android.content.Context;
-import android.content.SharedPreferences;
+import android.os.Handler;
+import android.os.Looper;
 
-import org.json.JSONArray;
-import org.json.JSONException;
-import org.json.JSONObject;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-import java.util.ArrayList;
-import java.util.Iterator;
-import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Random;
-import java.util.Set;
-import java.util.UUID;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import vn.ioc.minipostman.core.Json;
+import vn.ioc.minipostman.core.exec.ExecutionInput;
+import vn.ioc.minipostman.core.exec.ExecutionResult;
+import vn.ioc.minipostman.core.exec.RequestExecutor;
+import vn.ioc.minipostman.core.model.EnvDoc;
+import vn.ioc.minipostman.core.model.SecretCodec;
+import vn.ioc.minipostman.core.model.VarScope;
+import vn.ioc.minipostman.core.net.HttpEngine;
+import vn.ioc.minipostman.core.request.RequestModel;
+import vn.ioc.minipostman.core.script.JsSandbox;
+import vn.ioc.minipostman.data.AppDb;
+import vn.ioc.minipostman.data.AppSettings;
+import vn.ioc.minipostman.data.CollectionRepository;
+import vn.ioc.minipostman.data.EnvRepository;
+import vn.ioc.minipostman.data.HistoryRepository;
+import vn.ioc.minipostman.data.KeystoreSecretCodec;
+import vn.ioc.minipostman.data.LegacyMigration;
 
-/** Lưu environment và request vào SharedPreferences dưới dạng JSON. */
+/**
+ * Điểm truy cập chung tới dữ liệu và bộ chạy request. Thao tác DB chạy tuần tự trên một thread riêng
+ * ({@link #db}), request mạng chạy trên pool khác ({@link #net}) để không chặn nhau và không chặn UI.
+ */
 public final class Store {
 
-    public static final class Env {
-        public String name;
-        public final LinkedHashMap<String, String> vars = new LinkedHashMap<>();
-
-        public Env(String name) {
-            this.name = name;
-        }
-    }
-
-    public static final class Req {
-        public String id = UUID.randomUUID().toString();
-        public String folder = "";
-        public String name = "Request mới";
-        public String method = "GET";
-        public String url = "";
-        public String headers = "";
-        public String body = "";
-        public String extract = "";
-
-        public Req copy() {
-            Req c = new Req();
-            c.folder = folder;
-            c.name = name + " (copy)";
-            c.method = method;
-            c.url = url;
-            c.headers = headers;
-            c.body = body;
-            c.extract = extract;
-            return c;
-        }
-    }
-
-    private static final Pattern VAR = Pattern.compile("\\{\\{\\s*([^{}]+?)\\s*\\}\\}");
     private static Store instance;
 
-    private final SharedPreferences prefs;
-    public final List<Env> envs = new ArrayList<>();
-    public final List<Req> requests = new ArrayList<>();
-    public int activeEnv = 0;
+    public final AppDb database;
+    public final SecretCodec codec;
+    public final CollectionRepository collections;
+    public final EnvRepository envs;
+    public final HistoryRepository history;
+    public final AppSettings settings;
+    public final HttpEngine engine;
+    public final RequestExecutor executor;
+
+    private final ExecutorService dbExec = Executors.newSingleThreadExecutor();
+    private final ExecutorService netExec = Executors.newCachedThreadPool();
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     public static synchronized Store get(Context context) {
-        if (instance == null) {
-            instance = new Store(context.getApplicationContext());
-        }
+        if (instance == null) instance = new Store(context.getApplicationContext());
         return instance;
     }
 
-    private Store(Context context) {
-        prefs = context.getSharedPreferences("store", Context.MODE_PRIVATE);
-        load();
+    /** Dùng trong test để mỗi test có một Store (và DB) mới. */
+    static synchronized void resetForTests() {
+        instance = null;
     }
 
-    public Env activeEnvObj() {
-        if (envs.isEmpty()) {
-            envs.add(new Env("Default"));
+    private Store(final Context app) {
+        database = new AppDb(app);
+        codec = new KeystoreSecretCodec();
+        collections = new CollectionRepository(database, codec);
+        envs = new EnvRepository(database, codec);
+        history = new HistoryRepository(database);
+        settings = new AppSettings(app);
+        engine = new HttpEngine();
+        executor = new RequestExecutor(engine, new JsSandbox());
+        // Việc đầu tiên trên thread DB: chuyển dữ liệu của bản cũ (nếu có) trước mọi thao tác khác.
+        dbExec.execute(() -> LegacyMigration.run(app, collections, envs));
+    }
+
+    /** Chạy việc liên quan DB trên thread nền (tuần tự). */
+    public void db(Runnable r) {
+        dbExec.execute(r);
+    }
+
+    /** Chạy việc mạng/script trên pool riêng. */
+    public void net(Runnable r) {
+        netExec.execute(r);
+    }
+
+    public void main(Runnable r) {
+        mainHandler.post(r);
+    }
+
+    /**
+     * Chạy một request: dùng environment đang chọn + globals, rồi lưu lại các phạm vi biến mà script đã đổi
+     * và ghi vào history. Gọi từ thread nền.
+     */
+    public ExecutionResult execute(CollectionRepository.Context ctx, RequestModel model, String legacyExtract,
+                                   VarScope data, int iteration, int iterationCount, HttpEngine.CancelToken cancel) {
+        EnvDoc env = envs.getSelected();
+        EnvDoc globals = envs.getGlobals();
+
+        ExecutionInput in = new ExecutionInput();
+        in.collection = ctx.collection;
+        in.ancestors = ctx.ancestors;
+        in.requestId = ctx.node.id;
+        in.model = model;
+        in.legacyExtract = legacyExtract;
+        in.environment = env;
+        in.globals = globals;
+        in.data = data;
+        in.iteration = iteration;
+        in.iterationCount = iterationCount;
+        in.settings = settings.load();
+        in.cancel = cancel;
+
+        ExecutionResult res = executor.run(in);
+
+        if (res.envChanged) envs.save(env);
+        if (res.globalsChanged) envs.save(globals);
+        if (res.collectionChanged) collections.saveCollection(ctx.collection);
+
+        if (res.sent) {
+            HistoryRepository.Entry h = new HistoryRepository.Entry();
+            h.nodeId = ctx.node.id;
+            h.collectionId = ctx.collection.id;
+            h.name = model.name;
+            h.method = model.method;
+            h.url = model.url;
+            h.timestamp = System.currentTimeMillis();
+            boolean ok = res.response != null && !res.response.isError();
+            h.status = ok ? res.response.code : 0;
+            h.elapsedMs = ok ? res.response.timeMs : 0;
+            h.size = ok ? res.response.size : 0;
+            h.requestJson = Json.toJson(model.toItem());
+            history.add(h);
         }
-        if (activeEnv < 0 || activeEnv >= envs.size()) {
-            activeEnv = 0;
-        }
-        return envs.get(activeEnv);
-    }
-
-    public Env findEnv(String name) {
-        for (Env e : envs) {
-            if (e.name.equals(name)) return e;
-        }
-        return null;
-    }
-
-    public Req findReq(String id) {
-        if (id == null) return null;
-        for (Req r : requests) {
-            if (r.id.equals(id)) return r;
-        }
-        return null;
-    }
-
-    public Req newRequest() {
-        Req r = new Req();
-        requests.add(r);
-        save();
-        return r;
-    }
-
-    public void setVar(String key, String value) {
-        activeEnvObj().vars.put(key, value);
-        save();
-    }
-
-    /** Thay {{biến}} bằng giá trị trong environment đang chọn, hỗ trợ biến lồng biến. */
-    public String resolve(String text) {
-        if (text == null || text.isEmpty()) return "";
-        Map<String, String> vars = activeEnvObj().vars;
-        String cur = text;
-        for (int pass = 0; pass < 10; pass++) {
-            Matcher m = VAR.matcher(cur);
-            StringBuffer sb = new StringBuffer();
-            boolean changed = false;
-            while (m.find()) {
-                String key = m.group(1);
-                String val = dynamic(key);
-                if (val == null) val = vars.get(key);
-                if (val != null) {
-                    m.appendReplacement(sb, Matcher.quoteReplacement(val));
-                    changed = true;
-                } else {
-                    m.appendReplacement(sb, Matcher.quoteReplacement(m.group(0)));
-                }
-            }
-            m.appendTail(sb);
-            cur = sb.toString();
-            if (!changed) break;
-        }
-        return cur;
-    }
-
-    public Set<String> unresolved(String text) {
-        Set<String> out = new LinkedHashSet<>();
-        if (text == null) return out;
-        Matcher m = VAR.matcher(text);
-        while (m.find()) out.add(m.group(1));
-        return out;
-    }
-
-    private static String dynamic(String key) {
-        switch (key) {
-            case "$timestamp":
-                return String.valueOf(System.currentTimeMillis() / 1000);
-            case "$guid":
-            case "$randomUUID":
-                return UUID.randomUUID().toString();
-            case "$randomInt":
-                return String.valueOf(new Random().nextInt(1001));
-            default:
-                return null;
-        }
-    }
-
-    private static String str(JSONObject o, String key) {
-        Object v = o.opt(key);
-        return (v == null || v == JSONObject.NULL) ? "" : String.valueOf(v);
-    }
-
-    private void load() {
-        try {
-            JSONObject root = new JSONObject(prefs.getString("data", "{}"));
-            JSONArray es = root.optJSONArray("envs");
-            if (es != null) {
-                for (int i = 0; i < es.length(); i++) {
-                    JSONObject e = es.optJSONObject(i);
-                    if (e == null) continue;
-                    Env env = new Env(str(e, "name"));
-                    JSONObject vs = e.optJSONObject("vars");
-                    if (vs != null) {
-                        Iterator<String> it = vs.keys();
-                        while (it.hasNext()) {
-                            String k = it.next();
-                            env.vars.put(k, str(vs, k));
-                        }
-                    }
-                    envs.add(env);
-                }
-            }
-            JSONArray rs = root.optJSONArray("requests");
-            if (rs != null) {
-                for (int i = 0; i < rs.length(); i++) {
-                    JSONObject o = rs.optJSONObject(i);
-                    if (o == null) continue;
-                    Req r = new Req();
-                    if (!str(o, "id").isEmpty()) r.id = str(o, "id");
-                    r.folder = str(o, "folder");
-                    r.name = str(o, "name");
-                    r.method = str(o, "method").isEmpty() ? "GET" : str(o, "method");
-                    r.url = str(o, "url");
-                    r.headers = str(o, "headers");
-                    r.body = str(o, "body");
-                    r.extract = str(o, "extract");
-                    requests.add(r);
-                }
-            }
-            activeEnv = root.optInt("activeEnv", 0);
-        } catch (JSONException ignored) {
-            // Dữ liệu hỏng thì bắt đầu lại từ đầu.
-        }
-        activeEnvObj();
-    }
-
-    public void save() {
-        try {
-            JSONObject root = new JSONObject();
-            JSONArray es = new JSONArray();
-            for (Env e : envs) {
-                JSONObject o = new JSONObject();
-                o.put("name", e.name);
-                JSONObject vs = new JSONObject();
-                for (Map.Entry<String, String> en : e.vars.entrySet()) {
-                    vs.put(en.getKey(), en.getValue());
-                }
-                o.put("vars", vs);
-                es.put(o);
-            }
-            root.put("envs", es);
-            JSONArray rs = new JSONArray();
-            for (Req r : requests) {
-                JSONObject o = new JSONObject();
-                o.put("id", r.id);
-                o.put("folder", r.folder);
-                o.put("name", r.name);
-                o.put("method", r.method);
-                o.put("url", r.url);
-                o.put("headers", r.headers);
-                o.put("body", r.body);
-                o.put("extract", r.extract);
-                rs.put(o);
-            }
-            root.put("requests", rs);
-            root.put("activeEnv", activeEnv);
-            prefs.edit().putString("data", root.toString()).apply();
-        } catch (JSONException ignored) {
-            // put() chỉ ném lỗi với số NaN/Infinity, không xảy ra ở đây.
-        }
+        return res;
     }
 }
